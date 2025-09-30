@@ -1,0 +1,103 @@
+trigger:
+  branches:
+    include: [ main ]
+
+variables:
+  imageName: 'demo-app'
+  containerRegistry: '$(acrLoginServer)'   # Make sure this is set in your pipeline variable group or as output from Terraform
+  AKS_NAME: 'devopsdemoaks'               # replace with your AKS name or pipeline variable
+  RG: 'rg-devops-demo1'                   # replace with your resource group name
+
+stages:
+# ================= Build Stage =================
+- stage: Build
+  displayName: "Build & Scan"
+  jobs:
+  - job: Build
+    displayName: "Build Java App, SonarQube Scan & Docker Push"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    # Install Java 17
+    - task: JavaToolInstaller@0
+      displayName: 'Install Java 17'
+      inputs:
+        versionSpec: '17'
+        jdkArchitecture: 'x64'
+
+    # Maven Build
+    - task: Maven@3
+      displayName: 'Maven Clean Package'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean package'
+
+    # SonarQube Analysis
+    - task: SonarQubePrepare@5
+      displayName: 'Prepare SonarQube Analysis'
+      inputs:
+        SonarQube: 'SonarQubeServiceConnection'  # Must exist in Project Settings → Service Connections
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'demo-app'
+
+    - task: SonarQubeAnalyze@5
+      displayName: 'Run SonarQube Analysis'
+
+    - task: SonarQubePublish@5
+      displayName: 'Publish SonarQube Results'
+
+    # Docker Build & Push
+    - task: Docker@2
+      displayName: 'Build and Push Docker Image'
+      inputs:
+        command: buildAndPush
+        containerRegistry: 'ACRServiceConnection'  # Must exist in Project Settings → Service Connections
+        repository: '$(containerRegistry)/$(imageName)'
+        dockerfile: 'Dockerfile'
+        tags: '$(Build.BuildId)'
+
+    # Publish Artifacts
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Pipeline Artifacts'
+      inputs:
+        targetPath: 'target'
+        artifact: 'drop'
+
+# ================= CD Stage =================
+- stage: CD
+  displayName: "Deploy to AKS"
+  condition: succeeded()
+  jobs:
+  - deployment: DeployToAKS
+    displayName: "Deploy Application to AKS"
+    environment: 'aks-dev'   # Make sure this environment exists in DevOps
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          # Helm Installer
+          - task: HelmInstaller@1
+            displayName: 'Install Helm'
+            inputs:
+              helmVersionToInstall: 'latest'
+
+          # AKS Deployment using Helm
+          - task: AzureCLI@2
+            displayName: 'Deploy App to AKS via Helm'
+            inputs:
+              azureSubscription: 'AzureRM-DevopsDemo'  # Must exist in Project Settings → Service Connections
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Getting AKS credentials..."
+                az aks get-credentials -n ${AKS_NAME} -g ${RG} --overwrite-existing
+                echo "Deploying Helm chart..."
+                helm upgrade --install demo-app charts/demo-app \
+                  --set image.repository=$(containerRegistry)/$(imageName) \
+                  --set image.tag=$(Build.BuildId)
